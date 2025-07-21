@@ -500,11 +500,18 @@ async function runBackup() {
             totalExported += stats.exported;
             totalSkipped += stats.skipped;
             
-            // Collect all current page IDs for cleanup
-            const response = await callWithRetry(() => 
-                notion.databases.query({ database_id: database.id })
-            );
-            response.results.forEach(page => currentPageIds.add(page.id));
+            // Collect all current page IDs for cleanup (with proper pagination)
+            let nextCursor = undefined;
+            do {
+                const response = await callWithRetry(() => 
+                    notion.databases.query({
+                        database_id: database.id,
+                        start_cursor: nextCursor,
+                    })
+                );
+                response.results.forEach(page => currentPageIds.add(page.id));
+                nextCursor = response.next_cursor;
+            } while (nextCursor);
         }
         
         // Clean up files for pages that no longer exist
