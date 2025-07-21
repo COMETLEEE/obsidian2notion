@@ -44,12 +44,38 @@ async function saveBackupState(state) {
 }
 
 /**
- * Checks if a page needs to be updated based on last modified time
+ * Checks if a page contains images and if any of those image files are missing
+ * This is a simplified check that only runs when attachments folder has some files
+ * @param {string} pageId - The Notion page ID
+ * @returns {Promise<boolean>} True if page might have missing images
+ */
+async function pageHasMissingImages(pageId) {
+    try {
+        // Quick check: if attachments folder is empty, we already handle this globally
+        const files = await fs.readdir(ATTACHMENTS_DIR);
+        const imageFiles = files.filter(file => /\.(jpg|jpeg|png|gif|webp)$/i.test(file));
+        
+        if (imageFiles.length === 0) {
+            return false; // No images at all, handled by global forceImageRedownload
+        }
+        
+        // For now, we'll rely on the individual image checking during processing
+        // This is a placeholder for more sophisticated logic if needed
+        return false;
+        
+    } catch (error) {
+        return false; // If we can't check, don't force re-export
+    }
+}
+
+/**
+ * Checks if a page needs to be updated based on last modified time or missing images
  * @param {object} page - Notion page object
  * @param {object} backupState - Current backup state
- * @returns {boolean} True if page needs updating
+ * @param {boolean} forceImageRedownload - Force reprocessing if images are missing
+ * @returns {Promise<boolean>} True if page needs updating
  */
-function needsUpdate(page, backupState) {
+async function needsUpdate(page, backupState, forceImageRedownload = false) {
     const pageId = page.id;
     const currentModified = page.last_edited_time;
     
@@ -58,8 +84,39 @@ function needsUpdate(page, backupState) {
         return true;
     }
     
+    // If we need to force image redownload, check if this page contains images
+    if (forceImageRedownload) {
+        console.log(`  🔄 Forcing re-export to check for images: ${backupState.pages[pageId].title || 'Unknown'}`);
+        return true;
+    }
+    
     const lastBackedUpModified = backupState.pages[pageId].lastModified;
-    return currentModified !== lastBackedUpModified;
+    const timeChanged = currentModified !== lastBackedUpModified;
+    
+    // If time hasn't changed, check if the page file still exists
+    if (!timeChanged && backupState.pages[pageId].filePath) {
+        try {
+            await fs.access(backupState.pages[pageId].filePath);
+            
+            // File exists, but check if any images are missing
+            // Only do this check if we're not already forcing redownload globally
+            if (!forceImageRedownload) {
+                const hasMissingImages = await pageHasMissingImages(pageId);
+                if (hasMissingImages) {
+                    console.log(`  📷 Page has missing images, will re-export: ${backupState.pages[pageId].title}`);
+                    return true;
+                }
+            }
+            
+            return false;
+        } catch (error) {
+            // File is missing, need to re-export
+            console.log(`  📄 Page file missing, will re-export: ${backupState.pages[pageId].title}`);
+            return true;
+        }
+    }
+    
+    return timeChanged;
 }
 
 /**
@@ -72,20 +129,46 @@ async function downloadImage(url, filePath) {
     return new Promise((resolve) => {
         const file = require('fs').createWriteStream(filePath);
         
-        https.get(url, (response) => {
+        // Handle both http and https, and follow redirects
+        const client = url.startsWith('https:') ? https : require('http');
+        
+        const request = client.get(url, (response) => {
+            // Handle redirects
+            if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+                console.log(`  🔄 Following redirect to: ${response.headers.location}`);
+                file.close();
+                downloadImage(response.headers.location, filePath).then(resolve);
+                return;
+            }
+            
             if (response.statusCode === 200) {
+                console.log(`  📥 Downloading... (${response.headers['content-length'] || 'unknown'} bytes)`);
                 response.pipe(file);
                 file.on('finish', () => {
                     file.close();
                     resolve(true);
                 });
+                file.on('error', (err) => {
+                    file.close();
+                    console.error(`  ❌ File write error: ${err.message}`);
+                    resolve(false);
+                });
             } else {
                 file.close();
+                console.error(`  ❌ HTTP ${response.statusCode}: ${response.statusMessage}`);
                 resolve(false);
             }
         }).on('error', (err) => {
             file.close();
-            console.error(`Error downloading image: ${err.message}`);
+            console.error(`  ❌ Network error: ${err.message}`);
+            resolve(false);
+        });
+        
+        // Set a timeout
+        request.setTimeout(30000, () => {
+            request.destroy();
+            file.close();
+            console.error(`  ❌ Download timeout after 30 seconds`);
             resolve(false);
         });
     });
@@ -109,12 +192,12 @@ function generateSafeFilename(title) {
 /**
  * Converts Notion blocks to Markdown
  * @param {Array} blocks - Array of Notion blocks
- * @param {Set} downloadedImages - Set to track downloaded images
+ * @param {Map} downloadedImages - Map to track downloaded images (URL -> filename)
+ * @param {Object} imageContext - Context object with counter for unique naming
  * @returns {Promise<string>} Markdown content
  */
-async function blocksToMarkdown(blocks, downloadedImages) {
+async function blocksToMarkdown(blocks, downloadedImages, imageContext = { counter: 1 }) {
     let markdown = '';
-    let imageCounter = 1;
     
     for (const block of blocks) {
         switch (block.type) {
@@ -187,10 +270,25 @@ async function blocksToMarkdown(blocks, downloadedImages) {
                     }
                     
                     if (imageUrl) {
+                        console.log(`  🔍 Found image: ${imageUrl.substring(0, 100)}...`);
+                        
                         if (!downloadedImages.has(imageUrl)) {
-                            // Download new image
-                            const imageExtension = path.extname(new URL(imageUrl).pathname) || '.jpg';
-                            const imageName = `image_${Date.now()}_${imageCounter}${imageExtension}`;
+                            // Download new image with better unique naming
+                            let imageExtension;
+                            try {
+                                const urlObj = new URL(imageUrl);
+                                imageExtension = path.extname(urlObj.pathname);
+                                // If no extension from URL, try to detect from content-type later
+                                if (!imageExtension) {
+                                    imageExtension = '.jpg'; // Default fallback
+                                }
+                            } catch (error) {
+                                console.log(`  ⚠️  Could not parse URL, using .jpg extension`);
+                                imageExtension = '.jpg';
+                            }
+                            
+                            const timestamp = Date.now();
+                            const imageName = `image_${timestamp}_${String(imageContext.counter).padStart(4, '0')}${imageExtension}`;
                             const imagePath = path.join(ATTACHMENTS_DIR, imageName);
                             
                             console.log(`  📷 Downloading image: ${imageName}`);
@@ -199,16 +297,38 @@ async function blocksToMarkdown(blocks, downloadedImages) {
                             if (success) {
                                 downloadedImages.set(imageUrl, imageName);
                                 markdown += `![${imageName}](Attachments/${imageName})\n\n`;
-                                imageCounter++;
+                                imageContext.counter++;
+                                console.log(`  ✅ Successfully downloaded: ${imageName}`);
                             } else {
                                 console.log(`  ❌ Failed to download image: ${imageUrl}`);
                                 markdown += `![Image failed to download](${imageUrl})\n\n`;
                             }
                         } else {
-                            // Use existing downloaded image
+                            // Use existing downloaded image - but check if file still exists
                             const imageName = downloadedImages.get(imageUrl);
-                            markdown += `![${imageName}](Attachments/${imageName})\n\n`;
+                            const imagePath = path.join(ATTACHMENTS_DIR, imageName);
+                            
+                            try {
+                                await fs.access(imagePath);
+                                // File exists, use it
+                                markdown += `![${imageName}](Attachments/${imageName})\n\n`;
+                                console.log(`  ♻️  Reusing existing image: ${imageName}`);
+                            } catch (error) {
+                                // File is missing, need to re-download
+                                console.log(`  📷 Image file missing, re-downloading: ${imageName}`);
+                                const success = await downloadImage(imageUrl, imagePath);
+                                
+                                if (success) {
+                                    markdown += `![${imageName}](Attachments/${imageName})\n\n`;
+                                    console.log(`  ✅ Successfully re-downloaded: ${imageName}`);
+                                } else {
+                                    console.log(`  ❌ Failed to re-download image: ${imageUrl}`);
+                                    markdown += `![Image failed to download](${imageUrl})\n\n`;
+                                }
+                            }
                         }
+                    } else {
+                        console.log(`  ⚠️  Image block found but no URL available`);
                     }
                 } catch (error) {
                     console.error(`Error processing image: ${error.message}`);
@@ -247,7 +367,7 @@ async function blocksToMarkdown(blocks, downloadedImages) {
                 const childBlocks = await callWithRetry(() => 
                     notion.blocks.children.list({ block_id: block.id })
                 );
-                const childMarkdown = await blocksToMarkdown(childBlocks.results, downloadedImages);
+                const childMarkdown = await blocksToMarkdown(childBlocks.results, downloadedImages, imageContext);
                 markdown += childMarkdown;
             } catch (error) {
                 console.error(`Error fetching child blocks: ${error.message}`);
@@ -264,16 +384,18 @@ async function blocksToMarkdown(blocks, downloadedImages) {
  * @param {string} databaseDir - Directory for this database
  * @param {Map} downloadedImages - Map to track downloaded images (URL -> filename)
  * @param {object} backupState - Current backup state
+ * @param {Object} imageContext - Context object with counter for unique naming
+ * @param {boolean} forceImageRedownload - Force reprocessing if images are missing
  * @returns {Promise<boolean>} True if page was exported, false if skipped
  */
-async function exportPage(page, databaseDir, downloadedImages, backupState) {
+async function exportPage(page, databaseDir, downloadedImages, backupState, imageContext, forceImageRedownload = false) {
     const title = page.properties.Name?.title?.[0]?.text?.content || 'Untitled';
     const safeTitle = generateSafeFilename(title);
     const pageFileName = `${safeTitle}.md`;
     const pageFilePath = path.join(databaseDir, pageFileName);
     
     // Check if page needs updating
-    if (!needsUpdate(page, backupState)) {
+    if (!(await needsUpdate(page, backupState, forceImageRedownload))) {
         console.log(`  ⏭️  Skipping (no changes): ${title}`);
         return false;
     }
@@ -301,7 +423,7 @@ async function exportPage(page, databaseDir, downloadedImages, backupState) {
         markdown += `---\n\n`;
         
         // Convert blocks to markdown
-        const contentMarkdown = await blocksToMarkdown(blocks.results, downloadedImages);
+        const contentMarkdown = await blocksToMarkdown(blocks.results, downloadedImages, imageContext);
         markdown += contentMarkdown;
         
         // Write the markdown file
@@ -331,9 +453,11 @@ async function exportPage(page, databaseDir, downloadedImages, backupState) {
  * @param {string} databaseTitle - Database title for directory naming
  * @param {Map} downloadedImages - Map to track downloaded images (URL -> filename)
  * @param {object} backupState - Current backup state
+ * @param {Object} imageContext - Context object with counter for unique naming
+ * @param {boolean} forceImageRedownload - Force reprocessing if images are missing
  * @returns {Promise<{exported: number, skipped: number}>} Export statistics
  */
-async function exportDatabase(databaseId, databaseTitle, downloadedImages, backupState) {
+async function exportDatabase(databaseId, databaseTitle, downloadedImages, backupState, imageContext, forceImageRedownload = false) {
     const safeDatabaseTitle = generateSafeFilename(databaseTitle);
     const databaseDir = path.join(BACKUP_DIR, safeDatabaseTitle);
     
@@ -364,7 +488,7 @@ async function exportDatabase(databaseId, databaseTitle, downloadedImages, backu
     
     // Export each page (or skip if unchanged)
     for (const page of allPages) {
-        const wasExported = await exportPage(page, databaseDir, downloadedImages, backupState);
+        const wasExported = await exportPage(page, databaseDir, downloadedImages, backupState, imageContext, forceImageRedownload);
         
         if (wasExported) {
             exportedCount++;
@@ -389,22 +513,42 @@ async function exportDatabase(databaseId, databaseTitle, downloadedImages, backu
  */
 async function findAllDatabases(pageId, depth = 0) {
     const indent = '  '.repeat(depth);
-    console.log(`${indent}🔍 Searching for databases${depth === 0 ? ' in workspace...' : '...'}`);
+    console.log(`${indent}🔍 Searching for databases${depth === 0 ? ' in workspace...' : '...'} (depth: ${depth})`);
     
     let databases = [];
     
     try {
-        const response = await callWithRetry(() => notion.blocks.children.list({ block_id: pageId }));
+        // Handle pagination to get ALL blocks from this page
+        let allBlocks = [];
+        let nextCursor = undefined;
         
-        for (const block of response.results) {
+        do {
+            const response = await callWithRetry(() => 
+                notion.blocks.children.list({ 
+                    block_id: pageId,
+                    start_cursor: nextCursor,
+                    page_size: 100
+                })
+            );
+            allBlocks = allBlocks.concat(response.results);
+            nextCursor = response.next_cursor;
+            
+            if (nextCursor) {
+                console.log(`${indent}   📄 Found ${response.results.length} blocks, getting more...`);
+            }
+        } while (nextCursor);
+        
+        console.log(`${indent}   📊 Total blocks found: ${allBlocks.length}`);
+        
+        for (const block of allBlocks) {
             if (block.type === 'child_database') {
                 databases.push({
                     id: block.id,
                     title: block.child_database.title
                 });
-                console.log(`${indent}📊 Found database: "${block.child_database.title}"`);
+                console.log(`${indent}📊 Found database: "${block.child_database.title}" (depth: ${depth})`);
             } else if (block.type === 'child_page') {
-                console.log(`${indent}📄 Searching sub-page: "${block.child_page.title}"`);
+                console.log(`${indent}📄 Searching sub-page: "${block.child_page.title}" (depth: ${depth})`);
                 const subDatabases = await findAllDatabases(block.id, depth + 1);
                 databases = databases.concat(subDatabases);
             }
@@ -414,6 +558,73 @@ async function findAllDatabases(pageId, depth = 0) {
     }
     
     return databases;
+}
+
+/**
+ * Cleans up duplicate images in the attachments directory
+ * Keeps the oldest version of each image and removes duplicates
+ * @returns {Promise<number>} Number of duplicate files cleaned up
+ */
+async function cleanupDuplicateImages() {
+    console.log('🧹 Cleaning up duplicate images...');
+    
+    try {
+        const files = await fs.readdir(ATTACHMENTS_DIR);
+        const imageFiles = files.filter(file => /\.(jpg|jpeg|png|gif|webp)$/i.test(file));
+        
+        if (imageFiles.length === 0) {
+            console.log('  No images found to clean up');
+            return 0;
+        }
+        
+        // Group images by their original timestamp pattern
+        const imageGroups = new Map();
+        
+        for (const file of imageFiles) {
+            // Extract the base timestamp (remove the counter part for grouping)
+            const match = file.match(/^image_(\d+)_\d+\.(.*?)$/);
+            if (match) {
+                const [, timestamp, extension] = match;
+                const key = `${timestamp}_${extension}`;
+                
+                if (!imageGroups.has(key)) {
+                    imageGroups.set(key, []);
+                }
+                imageGroups.get(key).push(file);
+            }
+        }
+        
+        let cleanedUp = 0;
+        
+        // For each group, keep the first one and remove duplicates
+        for (const [key, group] of imageGroups) {
+            if (group.length > 1) {
+                // Sort by filename to get consistent ordering
+                group.sort();
+                const toKeep = group[0];
+                const toRemove = group.slice(1);
+                
+                console.log(`  📂 Found ${group.length} versions of image group ${key}`);
+                console.log(`    ✅ Keeping: ${toKeep}`);
+                
+                for (const file of toRemove) {
+                    try {
+                        await fs.unlink(path.join(ATTACHMENTS_DIR, file));
+                        console.log(`    🗑️  Removed: ${file}`);
+                        cleanedUp++;
+                    } catch (error) {
+                        console.error(`    ❌ Error removing ${file}:`, error.message);
+                    }
+                }
+            }
+        }
+        
+        return cleanedUp;
+        
+    } catch (error) {
+        console.error('Error during image cleanup:', error.message);
+        return 0;
+    }
 }
 
 /**
@@ -469,6 +680,24 @@ async function runBackup() {
             console.log(`📅 This is the first backup`);
         }
         
+        // Load existing images to avoid re-downloading
+        console.log('📷 Scanning existing images...');
+        const existingImages = new Map(); // URL -> filename
+        let forceImageRedownload = false;
+        try {
+            const existingFiles = await fs.readdir(ATTACHMENTS_DIR);
+            const imageFiles = existingFiles.filter(file => /\.(jpg|jpeg|png|gif|webp)$/i.test(file));
+            console.log(`  Found ${imageFiles.length} existing image files`);
+            
+            if (imageFiles.length === 0) {
+                console.log('  📷 No existing images found - will re-download all images from pages');
+                forceImageRedownload = true;
+            }
+        } catch (error) {
+            console.log('  📷 No existing images found - will re-download all images from pages');
+            forceImageRedownload = true;
+        }
+        
         // Find all databases
         const databases = await findAllDatabases(NOTION_PARENT_PAGE_ID);
         
@@ -486,6 +715,9 @@ async function runBackup() {
         // Track downloaded images to avoid duplicates (URL -> filename)
         const downloadedImages = new Map();
         
+        // Global image context for unique naming across all databases
+        const imageContext = { counter: 1 };
+        
         // Track statistics
         let totalExported = 0;
         let totalSkipped = 0;
@@ -496,7 +728,7 @@ async function runBackup() {
             // Save state before processing each database
             await saveBackupState(backupState);
             
-            const stats = await exportDatabase(database.id, database.title, downloadedImages, backupState);
+            const stats = await exportDatabase(database.id, database.title, downloadedImages, backupState, imageContext, forceImageRedownload);
             totalExported += stats.exported;
             totalSkipped += stats.skipped;
             
@@ -518,6 +750,10 @@ async function runBackup() {
         console.log('\n🧹 Cleaning up orphaned files...');
         const cleanedUp = await cleanupOrphanedFiles(backupState, currentPageIds);
         
+        // Clean up duplicate images
+        console.log('\n🧹 Cleaning up duplicate images...');
+        const duplicatesRemoved = await cleanupDuplicateImages();
+        
         // Update backup state
         backupState.lastBackup = new Date().toISOString();
         await saveBackupState(backupState);
@@ -529,10 +765,11 @@ async function runBackup() {
         console.log('\n🎉 Backup completed successfully!');
         console.log(`📁 Backup location: ${BACKUP_DIR}`);
         console.log(`📊 Exported ${databases.length} databases`);
-        console.log(`� Exported: ${totalExported} pages`);
+        console.log(`📄 Exported: ${totalExported} pages`);
         console.log(`⏭️  Skipped: ${totalSkipped} pages (no changes)`);
         console.log(`🗑️  Cleaned up: ${cleanedUp} orphaned files`);
-        console.log(`�📷 Downloaded ${downloadedImages.size} unique images`);
+        console.log(`🗑️  Removed: ${duplicatesRemoved} duplicate images`);
+        console.log(`📷 Downloaded ${downloadedImages.size} unique images`);
         
         if (totalSkipped > 0) {
             console.log(`\n⚡ Incremental backup saved time by skipping ${totalSkipped} unchanged pages!`);
