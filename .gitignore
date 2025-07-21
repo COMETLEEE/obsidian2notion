@@ -1,3 +1,5 @@
 .env
 notion-backup
 .DS_Store
+my-markdown-files
+.DS_Store

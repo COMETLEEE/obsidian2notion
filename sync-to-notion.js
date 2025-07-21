@@ -61,39 +61,51 @@ async function processSingleFile(filePath, existingPages) {
         console.log(`Processing: ${pageTitle}`);
         let markdownContent = await fs.readFile(filePath, 'utf8');
         
-        const imageRegex = /!\[(.*?)\]\((?!https?:\/\/)(.*?)\)|!\[\[(.*?)(?:\|.*?)?\]\]/g;
+        // Updated regex to match all attachments (images and other files)
+        const attachmentRegex = /!\[(.*?)\]\((?!https?:\/\/)(.*?)\)|!\[\[(.*?)(?:\|.*?)?\]\]/g;
         
-        const imageMatches = [...markdownContent.matchAll(imageRegex)];
+        const attachmentMatches = [...markdownContent.matchAll(attachmentRegex)];
         let successfulUploadCount = 0;
 
-        if (imageMatches.length > 0) {
-            console.log(`  Found ${imageMatches.length} local image(s) in ${pageTitle}`);
-            const uploadPromises = imageMatches.map(match => {
+        if (attachmentMatches.length > 0) {
+            console.log(`  Found ${attachmentMatches.length} local attachment(s) in ${pageTitle}`);
+            const uploadPromises = attachmentMatches.map(match => {
                 return (async () => {
                     const originalLinkText = match[0];
                     let altText = '';
-                    let originalImagePath = '';
+                    let originalAttachmentPath = '';
 
                     if (match[2] !== undefined) { 
                         altText = match[1];
-                        originalImagePath = match[2];
+                        originalAttachmentPath = match[2];
                     } else if (match[3] !== undefined) {
-                        originalImagePath = match[3];
-                        altText = path.basename(originalImagePath);
+                        originalAttachmentPath = match[3];
+                        altText = path.basename(originalAttachmentPath);
                     }
 
-                    if (!originalImagePath) return null;
+                    if (!originalAttachmentPath) return null;
 
                     try {
-                        const fullImagePath = await resolveImagePath(originalImagePath, filePath);
-                        if (fullImagePath) {
-                            const s3Url = await uploadFileToS3(fullImagePath);
+                        const fullAttachmentPath = await resolveImagePath(originalAttachmentPath, filePath);
+                        if (fullAttachmentPath) {
+                            const fileExtension = path.extname(originalAttachmentPath).toLowerCase();
+                            const isImage = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'].includes(fileExtension);
+                            
+                            const s3Url = await uploadFileToS3(fullAttachmentPath);
                             if (s3Url) {
-                                return { original: originalLinkText, replacement: `![${altText}](${s3Url})` };
+                                if (isImage) {
+                                    // For images, use the image markdown syntax
+                                    return { original: originalLinkText, replacement: `![${altText}](${s3Url})` };
+                                } else {
+                                    // For non-images, use link syntax with file type indicator
+                                    const fileType = fileExtension.replace('.', '').toUpperCase();
+                                    const displayName = altText || `${fileType} File`;
+                                    return { original: originalLinkText, replacement: `[📎 ${displayName}](${s3Url})` };
+                                }
                             }
                         }
                     } catch (e) {
-                        console.error(`    ❌ ERROR processing image link "${originalImagePath}": ${e.message}`);
+                        console.error(`    ❌ ERROR processing attachment "${originalAttachmentPath}": ${e.message}`);
                     }
                     return null;
                 })();
@@ -122,7 +134,7 @@ async function processSingleFile(filePath, existingPages) {
             parent: { database_id: databaseId },
             properties: {
                 'Name': { title: [{ text: { content: pageTitle } }] },
-                'Has Images': { checkbox: successfulUploadCount > 0 },
+                'Has Attachments': { checkbox: successfulUploadCount > 0 },
                 'Created Date': { date: { start: creationDate } },
             },
             children: firstChunk,
