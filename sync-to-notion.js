@@ -1,12 +1,13 @@
 require('dotenv').config();
 const { markdownToBlocks } = require('@tryfabric/martian');
 const fs = require('fs/promises');
+const errorFs = require('fs');
 const path = require('path');
 const { getOrCreateDatabaseForPath, fetchAllExistingPages, notion, callWithRetry } = require('./src/notion');
 const { uploadFileToS3 } = require('./src/s3');
 const { findMarkdownFiles } = require('./src/utils');
 const config = require('./config');
-
+const os = require('os');
 /**
  * Resolves the full path of an image, supporting both relative paths and a global attachments folder.
  * @param {string} imagePath - The path from the markdown link.
@@ -114,12 +115,13 @@ async function processSingleFile(filePath, existingPages) {
             const uploadResults = await Promise.all(uploadPromises);
             for (const result of uploadResults) {
                 if (result) {
-                    markdownContent = markdownContent.replace(result.original, result.replacement);
+                    // markdown replace separate image block
+                    markdownContent = markdownContent.replace(result.original, "\n" + result.replacement);
                     successfulUploadCount++;
                 }
             }
         }
-
+        
         const notionBlocks = markdownToBlocks(markdownContent);
         const stats = await fs.stat(filePath);
         const creationDate = stats.birthtime.toISOString().split('T')[0];
@@ -150,6 +152,7 @@ async function processSingleFile(filePath, existingPages) {
         console.log(`✅ Synced: ${pageTitle}`);
     } catch (error) {
         console.error(`❌ ERROR syncing "${pageTitle}": ${error.message}`);
+        errorFs.appendFileSync('error.log', `ERROR file path "${filePath}"` + os.EOL, 'utf8');
     }
 }
 
