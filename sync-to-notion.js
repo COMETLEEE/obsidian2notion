@@ -134,7 +134,7 @@ async function processSingleFile(filePath, existingPages) {
             parent: { database_id: databaseId },
             properties: {
                 'Name': { title: [{ text: { content: pageTitle } }] },
-                'Has Attachments': { checkbox: successfulUploadCount > 0 },
+                'Has Images': { checkbox: successfulUploadCount > 0 },
                 'Created Date': { date: { start: creationDate } },
             },
             children: firstChunk,
